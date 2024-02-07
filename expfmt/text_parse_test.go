@@ -703,3 +703,108 @@ type errReader struct {
 func (r *errReader) Read(p []byte) (int, error) {
 	return 0, r.err
 }
+
+// UTF-8 support tests
+
+func TestTextParseUtf8Support(t *testing.T) {
+	testTextParseUtf8Support(t)
+}
+
+func testTextParseUtf8Support(t testing.TB) {
+	scenarios := []struct {
+		in  string
+		out []*dto.MetricFamily
+	}{
+		// 1: Counters & gauges, docstrings, various whitespace, escape sequences.
+		{
+			in: `
+
+# HELP "my.noncompliant.metric" help text
+# TYPE "my.noncompliant.metric" counter
+{"my.noncompliant.metric", label="value"} 1
+`,
+			/*
+				   TOOO excluded test case
+
+				# HELP "my.noncompliant.metric2" help text
+				# TYPE "my.noncompliant.metric2" counter
+				{"my.noncompliant.metric2", "noncompliant.label"="value"} 1
+
+				# HELP "my.noncompliant_metric" help text
+				# TYPE "my.noncompliant_metric" counter
+				{"my.noncompliant_metric", label="value"} 1
+
+				# HELP "my.noncompliant_metric" help text
+				# TYPE "my.noncompliant_metric" counter
+				{__name__="my.noncompliant_metric", label="value"} 1
+
+				# HELP "my.noncompliant_metric" help text
+				# TYPE "my.noncompliant_metric" counter
+				{__name__="my.noncompliant_metric", label="value"} 1
+
+				# HELP "my.noncompliant_metric" help text
+				# TYPE "my.noncompliant_metric" counter
+				{label="value", "my.noncompliant_metric"} 1
+
+				# HELP "my \"quoted\" metric" help text
+				# TYPE "my \"quoted\" metric" counter
+				{"my \"quoted\" metric", label="value"} 1
+
+				      # HELP 'my "quoted" metric' help text
+				      # TYPE 'my "quoted" metric' counter
+				      {'my "quoted" metric', label="value"} 1
+
+			*/
+			out: []*dto.MetricFamily{
+				{
+					Name: proto.String("my.noncompliant.metric"),
+					Help: proto.String("help text"),
+					Type: dto.MetricType_COUNTER.Enum(),
+					Metric: []*dto.Metric{
+						{
+							Label: []*dto.LabelPair{
+								{
+									Name:  proto.String("label"),
+									Value: proto.String("value"),
+								},
+							},
+							Counter: &dto.Counter{
+								Value: proto.Float64(1),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for i, scenario := range scenarios {
+		out, err := parser.TextToMetricFamilies(strings.NewReader(scenario.in))
+		if err != nil {
+			t.Errorf("%d. error: %s", i, err)
+			continue
+		}
+		if expected, got := len(scenario.out), len(out); expected != got {
+			t.Errorf(
+				"%d. expected %d MetricFamilies, got %d",
+				i, expected, got,
+			)
+		}
+		for _, expected := range scenario.out {
+			got, ok := out[expected.GetName()]
+			if !ok {
+				t.Errorf(
+					"%d. expected MetricFamily %q, found none",
+					i, expected.GetName(),
+				)
+				continue
+			}
+			if expected.String() != got.String() {
+				t.Errorf(
+					"%d. expected MetricFamily %s, got %s",
+					i, expected, got,
+				)
+			}
+		}
+	}
+}

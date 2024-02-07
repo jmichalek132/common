@@ -60,6 +60,7 @@ type TextParser struct {
 	currentMF            *dto.MetricFamily
 	currentMetric        *dto.Metric
 	currentLabelPair     *dto.LabelPair
+	quoted               bool
 
 	// The remaining member variables are only used for summaries/histograms.
 	currentLabels map[string]string // All labels including '__name__' but excluding 'quantile'/'le'
@@ -193,6 +194,16 @@ func (p *TextParser) startComment() stateFn {
 	if p.skipBlankTab(); p.err != nil {
 		return nil // Unexpected end of input.
 	}
+	// TODO is this base placement to check if the metric name is quoted?
+	println(string(p.currentByte))
+	if p.currentByte == '"' {
+		// TODO where do I reset this?
+		p.quoted = true
+		p.currentByte, p.err = p.buf.ReadByte()
+		if p.err != nil {
+			return nil
+		}
+	}
 	if p.readTokenAsMetricName(); p.err != nil {
 		return nil // Unexpected end of input.
 	}
@@ -201,7 +212,7 @@ func (p *TextParser) startComment() stateFn {
 		// Again, this is not considered a syntax error.
 		return p.startOfLine
 	}
-	if !isBlankOrTab(p.currentByte) {
+	if !isBlankOrTabQuote(p.currentByte) {
 		p.parseError("invalid metric name in comment")
 		return nil
 	}
@@ -226,27 +237,109 @@ func (p *TextParser) startComment() stateFn {
 // readingMetricName represents the state where the last byte read (now in
 // p.currentByte) is the first byte of a metric name.
 func (p *TextParser) readingMetricName() stateFn {
-	if p.readTokenAsMetricName(); p.err != nil {
+	println(string(p.currentByte))
+	// UTF-8 shit
+	if p.currentByte == '{' {
+		p.currentByte, p.err = p.buf.ReadByte()
+		if p.err != nil {
+			// TODO missing p.parseError("invalid metric name")
+			return nil
+		}
+		// only metric name can start with a quote, there is preference for it to be at the beginning
+		if p.currentByte == '"' {
+
+			p.currentByte, p.err = p.buf.ReadByte()
+			if p.err != nil {
+				// TODO missing p.parseError("invalid metric name")
+				return nil
+			}
+
+			// TODO don't foget to reset it
+			p.quoted = true
+			if p.readTokenAsMetricName(); p.err != nil {
+				return nil
+			}
+			if p.currentToken.Len() == 0 {
+				p.parseError("invalid metric name")
+				return nil
+			}
+			// TODO not sure if this is the best way / place for it
+			// Skiping over the quote and , at the end of the metric name
+			// it's this case {"my.noncompliant.metric", label="value"} 1
+			println(string(p.currentByte))
+			p.currentByte, p.err = p.buf.ReadByte()
+			if p.err != nil {
+				// TODO missing p.parseError("invalid metric name")
+				return nil
+			}
+			println(string(p.currentByte))
+			p.setOrCreateCurrentMF()
+			// Now is the time to fix the type if it hasn't happened yet.
+			if p.currentMF.Type == nil {
+				p.currentMF.Type = dto.MetricType_UNTYPED.Enum()
+			}
+			p.currentMetric = &dto.Metric{}
+			// Do not append the newly created currentMetric to
+			// currentMF.Metric right now. First wait if this is a summary,
+			// and the metric exists already, which we can only know after
+			// having read all the labels.
+			if p.skipBlankTabIfCurrentBlankTab(); p.err != nil {
+				return nil // Unexpected end of input.
+			}
+			return p.readingLabelsUtf8
+
+		} else {
+			// either not a metric name or metric name with __name__ label
+
+		}
+
 		return nil
+
+	} else {
+		// Non UTF-8 shit
+		if p.readTokenAsMetricName(); p.err != nil {
+			return nil
+		}
+		if p.currentToken.Len() == 0 {
+			p.parseError("invalid metric name")
+			return nil
+		}
+		p.setOrCreateCurrentMF()
+		// Now is the time to fix the type if it hasn't happened yet.
+		if p.currentMF.Type == nil {
+			p.currentMF.Type = dto.MetricType_UNTYPED.Enum()
+		}
+		p.currentMetric = &dto.Metric{}
+		// Do not append the newly created currentMetric to
+		// currentMF.Metric right now. First wait if this is a summary,
+		// and the metric exists already, which we can only know after
+		// having read all the labels.
+		if p.skipBlankTabIfCurrentBlankTab(); p.err != nil {
+			return nil // Unexpected end of input.
+		}
+		return p.readingLabels
 	}
-	if p.currentToken.Len() == 0 {
-		p.parseError("invalid metric name")
-		return nil
+}
+
+// TODO update comment
+// readingLabelsUtf8 represents the state where the last byte read (now in
+// p.currentByte) is either the first byte of the label set (i.e. a '{'), or the
+// first byte of the value (otherwise).
+func (p *TextParser) readingLabelsUtf8() stateFn {
+	// Summaries/histograms are special. We have to reset the
+	// currentLabels map, currentQuantile and currentBucket before starting to
+	// read labels.
+	if p.currentMF.GetType() == dto.MetricType_SUMMARY || p.currentMF.GetType() == dto.MetricType_HISTOGRAM {
+		p.currentLabels = map[string]string{}
+		p.currentLabels[string(model.MetricNameLabel)] = p.currentMF.GetName()
+		p.currentQuantile = math.NaN()
+		p.currentBucket = math.NaN()
 	}
-	p.setOrCreateCurrentMF()
-	// Now is the time to fix the type if it hasn't happened yet.
-	if p.currentMF.Type == nil {
-		p.currentMF.Type = dto.MetricType_UNTYPED.Enum()
+	println(string(p.currentByte), "readingLabelsUtf8")
+	if p.currentByte == '{' {
+		return p.readingValue // metric value
 	}
-	p.currentMetric = &dto.Metric{}
-	// Do not append the newly created currentMetric to
-	// currentMF.Metric right now. First wait if this is a summary,
-	// and the metric exists already, which we can only know after
-	// having read all the labels.
-	if p.skipBlankTabIfCurrentBlankTab(); p.err != nil {
-		return nil // Unexpected end of input.
-	}
-	return p.readingLabels
+	return p.startLabelName
 }
 
 // readingLabels represents the state where the last byte read (now in
@@ -280,6 +373,11 @@ func (p *TextParser) startLabelName() stateFn {
 		}
 		return p.readingValue
 	}
+	// TODO handle this shit
+	if p.currentByte == '"' {
+		p.quoted = true
+	}
+	println(string(p.currentByte))
 	if p.readTokenAsLabelName(); p.err != nil {
 		return nil // Unexpected end of input.
 	}
@@ -549,6 +647,16 @@ func (p *TextParser) skipBlankTab() {
 	}
 }
 
+// skipBlankTab reads (and discards) bytes from p.buf until it encounters a byte
+// that is neither ' ' nor '\t'. That byte is left in p.currentByte.
+func (p *TextParser) skipBlankTabOrQuote() {
+	for {
+		if p.currentByte, p.err = p.buf.ReadByte(); p.err != nil || !isBlankOrTabQuote(p.currentByte) {
+			return
+		}
+	}
+}
+
 // skipBlankTabIfCurrentBlankTab works exactly as skipBlankTab but doesn't do
 // anything if p.currentByte is neither ' ' nor '\t'.
 func (p *TextParser) skipBlankTabIfCurrentBlankTab() {
@@ -610,14 +718,43 @@ func (p *TextParser) readTokenUntilNewline(recognizeEscapeSequence bool) {
 // but not into p.currentToken.
 func (p *TextParser) readTokenAsMetricName() {
 	p.currentToken.Reset()
-	if !isValidMetricNameStart(p.currentByte) {
-		return
-	}
-	for {
+	if p.quoted {
+		// TODO add missing validation for metric name
+		// TODO validate metric name char by char or the whole string at the end?
+		escaped := false
 		p.currentToken.WriteByte(p.currentByte)
-		p.currentByte, p.err = p.buf.ReadByte()
-		if p.err != nil || !isValidMetricNameContinuation(p.currentByte) {
+		for {
+			p.currentByte, p.err = p.buf.ReadByte()
+			if p.err != nil {
+				return
+			}
+			if escaped {
+				if p.currentByte == '"' {
+					p.currentToken.WriteByte(p.currentByte)
+				}
+				escaped = false
+				continue
+			}
+			switch p.currentByte {
+			case '"':
+				p.quoted = false
+				return
+			case '\\':
+				escaped = true
+			default:
+				p.currentToken.WriteByte(p.currentByte)
+			}
+		}
+	} else {
+		if !isValidMetricNameStart(p.currentByte) {
 			return
+		}
+		for {
+			p.currentToken.WriteByte(p.currentByte)
+			p.currentByte, p.err = p.buf.ReadByte()
+			if p.err != nil || !isValidMetricNameContinuation(p.currentByte) {
+				return
+			}
 		}
 	}
 }
@@ -628,6 +765,9 @@ func (p *TextParser) readTokenAsMetricName() {
 // but not into p.currentToken.
 func (p *TextParser) readTokenAsLabelName() {
 	p.currentToken.Reset()
+	if p.quoted {
+
+	}
 	if !isValidLabelNameStart(p.currentByte) {
 		return
 	}
@@ -735,6 +875,10 @@ func isValidMetricNameContinuation(b byte) bool {
 
 func isBlankOrTab(b byte) bool {
 	return b == ' ' || b == '\t'
+}
+
+func isBlankOrTabQuote(b byte) bool {
+	return b == ' ' || b == '\t' || b == '"' || b == '\''
 }
 
 func isCount(name string) bool {
